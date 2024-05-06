@@ -11,7 +11,7 @@ from transformers import TrainingArguments, Trainer
 from huggingface_hub import HfFolder
 from huggingface_hub import list_datasets, dataset_info, login
 
-login()
+#login()
 
 dataset = load_dataset('maikelcm/part_ocr_text', split='train')
 

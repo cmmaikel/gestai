@@ -9,7 +9,7 @@ from transformers import TrainingArguments, Trainer
 from huggingface_hub import login, HfFolder
 
 # Iniciar sesión en Hugging Face Hub
-login()
+#login()
 
 # Cargar el conjunto de datos
 dataset = load_dataset('maikelcm/part_ocr_text', split='train')
