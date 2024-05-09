@@ -7,9 +7,10 @@ from datasets import load_dataset
 from transformers import VisionEncoderDecoderModel, DonutProcessor
 from transformers import TrainingArguments, Trainer
 from huggingface_hub import login, HfFolder
+from torch.utils.data import DataLoader
 
 # Iniciar sesión en Hugging Face Hub
-#login()
+login()
 
 # Cargar el conjunto de datos
 dataset = load_dataset('maikelcm/part_ocr_text', split='train')
@@ -63,11 +64,11 @@ def preprocess_documents_for_donut(sample):
 
 proc_dataset = dataset.map(preprocess_documents_for_donut)
 
-print(f"Sample: {proc_dataset[45]['text']}")
-print(f"New special tokens: {new_special_tokens + [task_start_token] + [eos_token]}")
+#print(f"Sample: {proc_dataset[45]['text']}")
+#print(f"New special tokens: {new_special_tokens + [task_start_token] + [eos_token]}")
 
 # Load processor
-processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base-finetuned-cord-v2")
+processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base-finetuned-cord-v2", use_fast=True)
 
 # add new special tokens to tokenizer
 processor.tokenizer.add_special_tokens({"additional_special_tokens": new_special_tokens + [task_start_token] + [eos_token]})
@@ -78,36 +79,60 @@ processor.feature_extractor.size = [720,960] # should be (width, height)
 processor.feature_extractor.do_align_long_axis = False
 
 def transform_and_tokenize(sample, processor=processor, split="train", max_length=512, ignore_id=-100):
+    # Definir el dispositivo
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # create tensor from image
     try:
-        pixel_values = processor(
-            sample["image"], random_padding=split == "train", return_tensors="pt"
-        ).pixel_values.squeeze()
+        with torch.no_grad():
+            # Convertir la imagen a tensor y moverla a la GPU si está disponible
+            pixel_values = processor(
+                sample["image"].convert("RGB"),  # Convertir la imagen a RGB antes de procesarla
+                random_padding=split == "train",
+                return_tensors="pt"
+            ).pixel_values.squeeze().to(device)
     except Exception as e:
         print(sample)
         print(f"Error: {e}")
         return {}
 
     # tokenize document
-    input_ids = processor.tokenizer(
-        sample["text"],
-        add_special_tokens=False,
-        max_length=max_length,
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt",
-    )["input_ids"].squeeze(0)
+    with torch.no_grad():
+        # Procesar el texto en la CPU, ya que no puede ser procesado directamente en la GPU
+        input_ids = processor.tokenizer(
+            sample["text"],
+            add_special_tokens=False,
+            max_length=max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )["input_ids"].squeeze(0)
 
     labels = input_ids.clone()
     labels[labels == processor.tokenizer.pad_token_id] = ignore_id  # model doesn't need to predict pad token
+
+    # Liberar memoria GPU si es posible
+    torch.cuda.empty_cache()
+
     return {"pixel_values": pixel_values, "labels": labels, "target_sequence": sample["text"]}
 
-# need at least 32-64GB of RAM to run this
+
+
+
+# DataLoader con almacenamiento en disco y carga perezosa (lazy)
+def lazy_load_dataset(split, batch_size, num_workers):
+    return DataLoader(
+        proc_dataset[split],
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=False,  # Cargar en la CPU y mover a la GPU según sea necesario
+        persistent_workers=True  # Reduce el tiempo de carga de los trabajadores
+    )
+
+# Procesar el conjunto de datos
 processed_dataset = proc_dataset.map(transform_and_tokenize,remove_columns=["image","text"])
-
 processed_dataset = processed_dataset.train_test_split(test_size=0.1)
-print(processed_dataset)
-
 
 # Load model from huggingface.co
 model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base-finetuned-cord-v2")
@@ -126,17 +151,9 @@ model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids(
 # Mover el modelo y los datos a la GPU si está disponible
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
-processed_dataset = processed_dataset.map(lambda x: {k: v.to(device) for k, v in x.items()})
+processed_dataset = processed_dataset.map(lambda x: {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in x.items()})
 
-metric = evaluate.load("accuracy")
-
-# calculamos el accuracy de las predicciones
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-    return metric.compute(predictions=predictions, references=labels)
-
-# hyperparameters used for multiple args
+# Hyperparameters used for multiple args
 hf_repository_id = "maikelcm/donut-ft-cordv2-gestai"
 
 # Arguments for training
@@ -146,21 +163,19 @@ training_args = TrainingArguments(
     learning_rate=2e-5,
     per_device_train_batch_size=2,
     weight_decay=0.01,
-    #fp16=True,
     logging_steps=100,
     save_total_limit=2,
     evaluation_strategy="no",
     save_strategy="epoch",
-    #predict_with_generate=True,
-    # push to hub parameters
     report_to="tensorboard",
     push_to_hub=True,
     hub_strategy="every_save",
     hub_model_id=hf_repository_id,
     hub_token=HfFolder.get_token(),
+    fp16=True  # Utilizar FP16 para reducir el uso de memoria y acelerar el entrenamiento
 )
 
-# Create Trainer
+# Crear Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -168,10 +183,10 @@ trainer = Trainer(
     compute_metrics=compute_metrics,
 )
 
-# Start training
+# Iniciar entrenamiento
 trainer.train()
 
-# Save processor and create model card
+# Guardar procesador y crear tarjeta de modelo
 processor.save_pretrained(hf_repository_id)
 trainer.create_model_card()
 trainer.push_to_hub()
